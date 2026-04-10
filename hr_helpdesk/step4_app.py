@@ -28,6 +28,13 @@ from hr_helpdesk.step3_retriever import HRRetrievalPipeline, RetrievalConfig
 
 load_dotenv(PROJECT_ROOT / ".env")
 
+# Load Streamlit secrets into environment variables (for cloud deployment)
+try:
+    for key, value in st.secrets.items():
+        os.environ.setdefault(key, str(value))
+except Exception:
+    pass  # Running locally without secrets
+
 SUGGESTED_PROMPTS = [
     {
         "label": "Leave Rules",
