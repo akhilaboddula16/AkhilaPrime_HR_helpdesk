@@ -1,0 +1,56 @@
+# Environment & Secrets
+.env
+.env.local
+.env.*.local
+
+# Virtual Environment
+.venv/
+venv/
+env/
+ENV/
+.virtualenv
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Database & Temporary
+*.db
+*.sqlite
+*.sqlite3
+pgvector_data/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Logs
+*.log
+logs/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Build tools
+uv.lock
+poetry.lock
+Pipfile.lock

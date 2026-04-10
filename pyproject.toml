@@ -1,0 +1,22 @@
+[project]
+name = "akhilaprime-hr-helpdesk"
+version = "0.1.0"
+description = "RAG HR helpdesk for AkhilaPrime HR policy documents"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "langchain>=0.3.27",
+    "langchain-google-genai>=2.1.12",
+    "langchain-postgres>=0.0.17",
+    "psycopg[binary]>=3.2.9",
+    "python-dotenv>=1.1.1",
+    "streamlit>=1.55.0",
+    "tqdm>=4.67.1",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["hr_helpdesk*"]
