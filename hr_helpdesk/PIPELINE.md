@@ -1,23 +1,132 @@
-# AkhilaPrime HR Helpdesk Pipeline Guide
+# AkhilaPrime HR Helpdesk — Pipeline Guide
 
-A beginner-friendly breakdown of the four application files and the order they run in.
+A beginner-friendly breakdown of all six application files and two answer modes.
 
-## File order
+---
 
-```text
-hr_helpdesk/
-|-- step1_chunking.py    <- Step 1: Read and split HR policy docs
-|-- step2_indexing.py    <- Step 2: Embed chunks and store them in PGVector
-|-- step3_retriever.py   <- Step 3: Retrieve relevant chunks for a query
-`-- step4_app.py         <- Step 4: Streamlit chat UI
+## Architecture Overview
+
+```
+                         ┌─────────────────────────────────────┐
+                         │        step4_app.py  (UI)           │
+                         │                                     │
+                         │   ┌──────────┐   ┌──────────────┐  │
+                         │   │ Classic  │   │  Agentic RAG │  │
+  User Question ─────────►   │  RAG     │   │  (ReAct)     │  │
+                         │   └────┬─────┘   └──────┬───────┘  │
+                         └────────┼────────────────┼──────────┘
+                                  │                │
+                    ┌─────────────▼──┐     ┌───────▼────────────────┐
+                    │ step3_retriever│     │    step6_agent.py       │
+                    │ (single search)│     │  LangGraph ReAct Agent  │
+                    └────────┬───────┘     │   ┌─────────────────┐  │
+                             │             │   │  step5_tools.py │  │
+                             │             │   │  - search_policy│  │
+                             │             │   │  - list_policies│  │
+                             │             │   │  - get_sections │  │
+                             │             │   └────────┬────────┘  │
+                             │             └────────────┼───────────┘
+                             │                          │  (iterates
+                             │                          │   as needed)
+                             ▼                          ▼
+                         PGVector ◄────── step2_indexing.py ◄── step1_chunking.py
+                         (embeddings)    (Gemini Embed)          (markdown docs)
 ```
 
-## How to run
+---
+
+## File Order
+
+```
+hr_helpdesk/
+├── step1_chunking.py   ← Step 1 : Read and split HR policy docs
+├── step2_indexing.py   ← Step 2 : Embed chunks and store in PGVector
+├── step3_retriever.py  ← Step 3 : Retrieve relevant chunks for a query
+├── step4_app.py        ← Step 4 : Streamlit chat UI (Classic + Agentic modes)
+├── step5_tools.py      ← Step 5 : LangChain Tool wrappers for the agent
+└── step6_agent.py      ← Step 6 : LangGraph ReAct agent (Agentic RAG)
+```
+
+---
+
+## What Each Step Does
+
+| File | Responsibility |
+|---|---|
+| `step1_chunking.py` | Reads `.md` files from `docs/` and splits them into section-level chunks. |
+| `step2_indexing.py` | Builds LangChain documents, calls Gemini embeddings, stores vectors in PGVector. |
+| `step3_retriever.py` | Queries PGVector using MMR → threshold → similarity fallback retrieval. |
+| `step4_app.py` | Streamlit UI. Toggle between **Classic RAG** and **Agentic RAG** modes in the sidebar. |
+| `step5_tools.py` | Three `@tool`-decorated functions the agent can call: `search_hr_policy`, `list_available_policies`, `get_policy_sections`. |
+| `step6_agent.py` | LangGraph `StateGraph` ReAct agent. Thinks → calls tools → observes → repeats → produces a cited final answer with a reasoning trace. |
+
+---
+
+## The Two Answer Modes
+
+### Classic RAG (default)
+
+```
+User Question
+     │
+     ▼
+step3_retriever   (single semantic search)
+     │
+     ▼
+Gemini LLM        (one prompt with context)
+     │
+     ▼
+Final Answer + Evidence Pack
+```
+
+**Characteristics:** Fast, predictable, one retrieval call per question.
+
+---
+
+### Agentic RAG (toggle ON in sidebar)
+
+```
+User Question
+     │
+     ▼
+┌─── Agent Node (Gemini + tools bound) ───────────────────┐
+│  Think: "What do I need to search for?"                  │
+│     │                                                    │
+│     ▼                                                    │
+│  Tool Call: search_hr_policy("earned leave days")        │
+│     │                                                    │
+│     ▼                                                    │
+│  Observe: Retrieved 5 policy sections                    │
+│     │                                                    │
+│     ▼                                                    │
+│  Think: "I also need carry-forward rules. Search again." │
+│     │                                                    │
+│     ▼                                                    │
+│  Tool Call: search_hr_policy("leave carry forward rules")│
+│     │                                                    │
+│     ▼                                                    │
+│  Observe: Got more sections                              │
+│     │                                                    │
+│     ▼                                                    │
+│  Think: "I have enough. Draft the final answer."         │
+└──────────────────────────────────────────────────────────┘
+     │
+     ▼
+Final Answer + Full Reasoning Trace (visible in UI)
+```
+
+**Characteristics:** More thorough, multi-step reasoning, can search multiple times,
+shows its thinking, better for complex or multi-part questions.
+
+---
+
+## How to Run
 
 ### One-time setup: build the index
 
 ```powershell
-cd D:\AkhilaPrime_HR
+cd c:\GenAI_questions\agentic-rag_project\AkhilaPrime_HR_
+.venv\Scripts\activate
 python -m hr_helpdesk.step2_indexing
 ```
 
@@ -29,14 +138,15 @@ python -m hr_helpdesk.step2_indexing
 streamlit run hr_helpdesk/step4_app.py
 ```
 
-## What each step does
+Then use the **Answer Mode** toggle in the sidebar to switch between Classic RAG and Agentic RAG.
 
-| File | Responsibility |
-| --- | --- |
-| `step1_chunking.py` | Reads `.md` files from `docs/` and splits them into section-level chunks. |
-| `step2_indexing.py` | Builds LangChain documents, calls Gemini embeddings, and stores vectors in PGVector. |
-| `step3_retriever.py` | Queries PGVector using MMR first, then threshold or similarity fallback retrieval. |
-| `step4_app.py` | Runs the Streamlit UI, retrieves context, sends prompts to Gemini, and shows evidence-backed answers. |
+### Test the agent from the CLI
+
+```powershell
+python -m hr_helpdesk.step6_agent "How many sick leave days do I get and can I carry them forward?"
+```
+
+---
 
 ## Neon PostgreSQL Setup Guide
 
@@ -89,6 +199,8 @@ This creates tables and loads embeddings to Neon.
 ### Step 6: Deploy
 
 Your Neon database is now ready for production deployments (Streamlit Cloud, Vercel, Railway, etc.)
+
+---
 
 ## Config (`.env`)
 

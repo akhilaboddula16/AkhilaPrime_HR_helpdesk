@@ -1,7 +1,10 @@
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Step 4 — App (Streamlit UI)
-# Purpose : The main chat interface. Ties together Steps 1-3:
-#           chunks → embeddings → retrieval → Gemini answer → display.
+# Purpose : The main chat interface. Supports two modes:
+#   Classic RAG  : chunks → embeddings → retrieval → Gemini answer
+#   Agentic RAG  : ReAct agent (step6_agent.py) that autonomously
+#                  reasons, selects tools, iterates, and produces a
+#                  fully cited, grounded answer with a reasoning trace.
 # Run     : streamlit run hr_helpdesk/step4_app.py
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 from __future__ import annotations
@@ -11,6 +14,14 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
+
+from tenacity import (
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+    RetryError,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -25,6 +36,8 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from hr_helpdesk.step1_chunking import iter_markdown_files, split_markdown_sections
 from hr_helpdesk.step2_indexing import IndexingConfig, build_vector_store
 from hr_helpdesk.step3_retriever import HRRetrievalPipeline, RetrievalConfig
+from hr_helpdesk.step6_agent import AgentResult, run_agent
+from hr_helpdesk.step5_tools import reset_pipeline as reset_agent_pipeline
 
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -116,8 +129,69 @@ def has_google_api_key() -> bool:
     return bool(os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"))
 
 
-def format_runtime_error(exc: Exception) -> str:
+def _is_retryable(exc: BaseException) -> bool:
+    """Return True for transient Gemini / network errors that are safe to retry."""
+    msg = str(exc)
+    return any(marker in msg for marker in (
+        "503", "UNAVAILABLE", "high demand", "overloaded",
+        "502", "504", "RESOURCE_EXHAUSTED", "Connection reset",
+        "RemoteDisconnected", "ConnectionError",
+        "SSL connection has been closed unexpectedly",
+    ))
+
+
+@retry(
+    retry=retry_if_exception(_is_retryable),
+    wait=wait_exponential(multiplier=1, min=2, max=30),
+    stop=stop_after_attempt(4),
+    reraise=True,
+)
+def _invoke_with_retry(llm: ChatGoogleGenerativeAI, prompt: object) -> object:
+    """Call llm.invoke(prompt) with automatic exponential-backoff on 503/overload."""
+    return llm.invoke(prompt)
+
+
+def _is_connection_error(exc: BaseException) -> bool:
+    """Check if the exception is a PostgreSQL / SSL connection drop."""
+    msg = str(exc).lower()
+    return any(m in msg for m in (
+        "ssl connection has been closed unexpectedly",
+        "connection reset",
+        "server closed the connection unexpectedly",
+        "broken pipe",
+        "connection timed out",
+        "ssl syscall error",
+    ))
+
+
+def format_runtime_error(exc: BaseException) -> str:
+    # Unwrap RetryError to get the original cause
+    if isinstance(exc, RetryError) and exc.last_attempt.failed:
+        exc = exc.last_attempt.exception()
+
     error_text = str(exc)
+
+    if any(m in error_text for m in ("503", "UNAVAILABLE", "high demand", "overloaded")):
+        return (
+            "⚠️ Gemini is currently experiencing high demand (503 Overloaded).\n\n"
+            "The app already retried automatically up to 4 times with exponential back-off. "
+            "The model is still unavailable right now.\n\n"
+            "What you can do:\n"
+            "\u2022 Wait 30–60 seconds and ask again — these spikes are usually short-lived.\n"
+            "\u2022 Try a shorter or simpler question first.\n"
+            "\u2022 Switch to Classic RAG mode in the sidebar (it uses fewer API calls)."
+        )
+
+    if _is_connection_error(exc):
+        # Clear the cached pipeline so next request gets a fresh connection
+        get_pipeline.clear()
+        reset_agent_pipeline()
+        return (
+            "⚠️ The database connection was dropped (SSL closed unexpectedly).\n\n"
+            "This happens when the cloud PostgreSQL server (Neon) closes idle connections. "
+            "The app has automatically cleared its connection cache.\n\n"
+            "**Just ask your question again** — it will reconnect automatically."
+        )
 
     if "API_KEY_SERVICE_BLOCKED" in error_text and "BatchEmbedContents" in error_text:
         return (
@@ -149,18 +223,25 @@ def rebuild_index() -> int:
     config = IndexingConfig()
     _, count = build_vector_store(config=config, reset=True)
     get_pipeline.clear()
+    reset_agent_pipeline()  # also flush the agent's retriever singleton
     return count
 
 
 def answer_question(question: str) -> tuple[str, list[dict[str, str]], str]:
+    """Classic RAG: single retrieve → LLM pass (with retry on 503)."""
     pipeline = get_pipeline()
     retrieval_result = pipeline.retrieve(question)
     context = "\n\n".join(doc.page_content for doc in retrieval_result.docs)
     prompt = ANSWER_PROMPT.format(context=context, question=question)
-    response = get_llm().invoke(prompt)
+    response = _invoke_with_retry(get_llm(), prompt)
     answer = response.content if isinstance(response.content, str) else str(response.content)
     evidence = build_evidence(retrieval_result.docs)
     return answer, evidence, retrieval_result.search_strategy
+
+
+def answer_question_agentic(question: str) -> AgentResult:
+    """Agentic RAG: ReAct agent reasons, calls tools, iterates, then answers."""
+    return run_agent(question)
 
 
 def build_evidence(docs: list[Document]) -> list[dict[str, str]]:
@@ -186,10 +267,15 @@ def build_evidence(docs: list[Document]) -> list[dict[str, str]]:
 def init_session_state() -> None:
     st.session_state.setdefault("messages", [])
     st.session_state.setdefault("queued_query", None)
+    st.session_state.setdefault("agent_mode", False)  # False = Classic RAG, True = Agentic RAG
 
 
 def queue_prompt(prompt: str) -> None:
     st.session_state.queued_query = prompt
+
+
+def is_agent_mode() -> bool:
+    return st.session_state.get("agent_mode", False)
 
 
 def format_html_text(text: str) -> str:
@@ -913,6 +999,134 @@ def inject_styles() -> None:
                 grid-template-columns: 1fr;
             }
         }
+
+        /* ── Agentic RAG Styles ─────────────────────────────────────── */
+
+        .agent-mode-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            padding: 0.42rem 0.85rem;
+            border-radius: 999px;
+            background: linear-gradient(135deg, rgba(124, 58, 237, 0.18), rgba(79, 70, 229, 0.12));
+            border: 1px solid rgba(124, 58, 237, 0.28);
+            color: #7c3aed;
+            font-size: 0.78rem;
+            font-weight: 700;
+            letter-spacing: 0.09em;
+            text-transform: uppercase;
+        }
+
+        .agent-panel {
+            border-radius: 22px;
+            padding: 1rem 1.05rem;
+            border: 1px solid rgba(124, 58, 237, 0.18);
+            background: linear-gradient(180deg, rgba(245, 243, 255, 0.98) 0%, rgba(237, 233, 254, 0.95) 100%);
+            box-shadow: 0 12px 32px rgba(79, 70, 229, 0.08);
+        }
+
+        .agent-panel .message-kicker {
+            color: #7c3aed;
+        }
+
+        .agent-panel .message-body {
+            color: #1e1b4b;
+        }
+
+        .agent-trace-shell {
+            margin-top: 0.75rem;
+            border-radius: 18px;
+            border: 1px solid rgba(124, 58, 237, 0.15);
+            overflow: hidden;
+            background: rgba(255, 255, 255, 0.55);
+        }
+
+        .trace-step {
+            padding: 0.7rem 0.9rem;
+            border-bottom: 1px solid rgba(124, 58, 237, 0.08);
+            font-size: 0.88rem;
+            line-height: 1.5;
+        }
+
+        .trace-step:last-child { border-bottom: none; }
+
+        .trace-thought {
+            background: rgba(245, 243, 255, 0.7);
+            color: #4c1d95;
+        }
+
+        .trace-tool-call {
+            background: rgba(236, 252, 243, 0.8);
+            color: #065f46;
+        }
+
+        .trace-tool-result {
+            background: rgba(255, 251, 235, 0.8);
+            color: #78350f;
+        }
+
+        .trace-label {
+            font-size: 0.72rem;
+            font-weight: 700;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            margin-bottom: 0.22rem;
+            opacity: 0.75;
+        }
+
+        .trace-content {
+            font-family: "Trebuchet MS", sans-serif;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .agent-meta-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.45rem;
+            margin: 0.38rem 0 0.15rem 0;
+        }
+
+        .agent-meta-pill {
+            display: inline-flex;
+            align-items: center;
+            border-radius: 999px;
+            padding: 0.38rem 0.72rem;
+            background: rgba(124, 58, 237, 0.09);
+            border: 1px solid rgba(124, 58, 237, 0.16);
+            color: #5b21b6;
+            font-size: 0.8rem;
+            font-weight: 700;
+        }
+
+        .mode-switch-card {
+            border-radius: 20px;
+            padding: 1rem;
+            background: linear-gradient(180deg, rgba(124, 58, 237, 0.14) 0%, rgba(79, 70, 229, 0.10) 100%);
+            border: 1px solid rgba(124, 58, 237, 0.22);
+            margin-bottom: 0.9rem;
+        }
+
+        .mode-switch-label {
+            color: #c4b5fd;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            font-size: 0.76rem;
+            margin-bottom: 0.3rem;
+        }
+
+        .mode-switch-value {
+            color: white;
+            font-size: 1rem;
+            font-weight: 700;
+        }
+
+        .mode-switch-copy {
+            color: rgba(196, 181, 253, 0.85);
+            font-size: 0.84rem;
+            margin-top: 0.25rem;
+            line-height: 1.5;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -1027,6 +1241,43 @@ def render_sidebar(stats: dict[str, str | int]) -> None:
             """,
             unsafe_allow_html=True,
         )
+
+        # ── Mode Switcher ────────────────────────────────────────────
+        st.markdown('<div class="mode-switch-label" style="color:#c4b5fd;margin:0.6rem 0 0.25rem;font-size:0.74rem;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;">Answer Mode</div>', unsafe_allow_html=True)
+        mode_on = st.toggle(
+            "Agentic RAG (ReAct)",
+            value=st.session_state.get("agent_mode", False),
+            key="agent_mode_toggle",
+            help="Classic RAG: one retrieve → LLM call. Agentic RAG: the agent reasons, calls tools multiple times, and self-checks before answering.",
+        )
+        st.session_state["agent_mode"] = mode_on
+
+        if mode_on:
+            st.markdown(
+                """
+                <div class="mode-switch-card">
+                    <div class="mode-switch-value">&#x1F916; Agentic Mode ON</div>
+                    <div class="mode-switch-copy">
+                        ReAct agent will reason step-by-step, call tools autonomously,
+                        and show its full thinking trace alongside the answer.
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                """
+                <div style="border-radius:20px;padding:0.8rem 1rem;background:rgba(255,255,255,0.07);
+                            border:1px solid rgba(255,255,255,0.1);margin-bottom:0.9rem;">
+                    <div style="color:white;font-size:0.95rem;font-weight:700;">&#x26A1; Classic RAG Mode</div>
+                    <div style="color:rgba(220,230,255,0.8);font-size:0.84rem;margin-top:0.2rem;">
+                        Single retrieve &rarr; Gemini answer. Fast and direct.
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
         if st.button("Rebuild Knowledge Index", use_container_width=True):
             with st.spinner("Refreshing indexed policy sections..."):
@@ -1158,6 +1409,55 @@ def render_conversation_header() -> None:
     )
 
 
+def render_agent_trace(steps: list[dict]) -> None:
+    """Render the ReAct reasoning trace inside an expander."""
+    if not steps:
+        return
+    thoughts = [s for s in steps if s["type"] == "thought"]
+    tool_calls = [s for s in steps if s["type"] == "tool_call"]
+    tool_results = [s for s in steps if s["type"] == "tool_result"]
+
+    with st.expander(
+        f"🧠 Agent reasoning trace — {len(tool_calls)} tool call(s), {len(thoughts)} thought(s)",
+        expanded=False,
+    ):
+        for step in steps:
+            stype = step["type"]
+            if stype == "thought":
+                content_preview = step["content"][:600] + ("..." if len(step["content"]) > 600 else "")
+                st.markdown(
+                    f"""
+                    <div class="trace-step trace-thought">
+                        <div class="trace-label">💭 Agent Thought</div>
+                        <div class="trace-content">{html.escape(content_preview)}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            elif stype == "tool_call":
+                args_str = ", ".join(f"{k}={v!r}" for k, v in step["args"].items())
+                st.markdown(
+                    f"""
+                    <div class="trace-step trace-tool-call">
+                        <div class="trace-label">🔧 Tool Call: {html.escape(step['tool'])}</div>
+                        <div class="trace-content">{html.escape(args_str)}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            elif stype == "tool_result":
+                preview = step["content"][:500] + ("..." if len(step["content"]) > 500 else "")
+                st.markdown(
+                    f"""
+                    <div class="trace-step trace-tool-result">
+                        <div class="trace-label">📄 Result from {html.escape(step['tool'])}</div>
+                        <div class="trace-content">{html.escape(preview)}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+
 def render_messages() -> None:
     for message in st.session_state.messages:
         if message["role"] == "user":
@@ -1173,6 +1473,43 @@ def render_messages() -> None:
                 )
             continue
 
+        # ── Agentic message ──────────────────────────────────────────
+        if message.get("mode") == "agent":
+            with st.chat_message("assistant", avatar=":material/smart_toy:"):
+                tool_count = len(message.get("tool_calls", []))
+                source_count = len(message.get("sources", []))
+                st.markdown(
+                    f"""
+                    <div class="agent-panel">
+                        <div class="message-kicker">&#x1F916; Agentic Policy Answer</div>
+                        <div class="message-body">{format_html_text(message['content'])}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    f"""
+                    <div class="agent-meta-row">
+                        <span class="agent-meta-pill">Mode: AGENTIC ReAct</span>
+                        <span class="agent-meta-pill">Tool calls: {tool_count}</span>
+                        <span class="agent-meta-pill">Sources: {source_count}</span>
+                        <span class="agent-meta-pill">Iterations: {message.get('iterations', '?')}</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                render_agent_trace(message.get("reasoning_steps", []))
+
+                if message.get("sources"):
+                    with st.expander("📂 Policy sources referenced", expanded=False):
+                        for src in message["sources"]:
+                            st.markdown(
+                                f'<div class="evidence-card"><div class="evidence-source">&#x1F4C4; {html.escape(src)}</div></div>',
+                                unsafe_allow_html=True,
+                            )
+            continue
+
+        # ── Classic RAG message ──────────────────────────────────────
         with st.chat_message("assistant", avatar=":material/verified_user:"):
             st.markdown(
                 f"""
@@ -1212,31 +1549,67 @@ def render_messages() -> None:
 def process_query(question: str) -> None:
     st.session_state.messages.append({"role": "user", "content": question})
 
-    try:
-        with st.status("Consulting the policy library...", expanded=False) as status:
-            status.write("Scanning indexed HR sections.")
-            answer, evidence, strategy = answer_question(question)
-            status.write("Drafting a policy-grounded response.")
-            status.update(label="Response ready", state="complete", expanded=False)
-    except Exception as exc:
+    if is_agent_mode():
+        # ── Agentic RAG path ─────────────────────────────────────────
+        try:
+            with st.status("🤖 Agent is reasoning...", expanded=True) as status:
+                status.write("Starting ReAct agent loop — the agent will decide which tools to call.")
+                result = answer_question_agentic(question)
+                tool_names = list({tc["tool"] for tc in result.tool_calls_made})
+                status.write(f"Agent completed: {len(result.tool_calls_made)} tool call(s) to: {', '.join(tool_names) or 'none'}.")
+                status.update(label="Agent answer ready", state="complete", expanded=False)
+        except Exception as exc:
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": format_runtime_error(exc),
+                    "mode": "agent",
+                    "reasoning_steps": [],
+                    "tool_calls": [],
+                    "sources": [],
+                    "iterations": 0,
+                }
+            )
+            return
+
         st.session_state.messages.append(
             {
                 "role": "assistant",
-                "content": format_runtime_error(exc),
-                "evidence": [],
-                "strategy": "unavailable",
+                "content": result.final_answer,
+                "mode": "agent",
+                "reasoning_steps": result.reasoning_steps,
+                "tool_calls": result.tool_calls_made,
+                "sources": result.sources,
+                "iterations": result.iterations,
             }
         )
-        return
+    else:
+        # ── Classic RAG path ─────────────────────────────────────────
+        try:
+            with st.status("Consulting the policy library...", expanded=False) as status:
+                status.write("Scanning indexed HR sections.")
+                answer, evidence, strategy = answer_question(question)
+                status.write("Drafting a policy-grounded response.")
+                status.update(label="Response ready", state="complete", expanded=False)
+        except Exception as exc:
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": format_runtime_error(exc),
+                    "evidence": [],
+                    "strategy": "unavailable",
+                }
+            )
+            return
 
-    st.session_state.messages.append(
-        {
-            "role": "assistant",
-            "content": answer,
-            "evidence": evidence,
-            "strategy": strategy,
-        }
-    )
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": answer,
+                "evidence": evidence,
+                "strategy": strategy,
+            }
+        )
 
 
 def main() -> None:
@@ -1275,8 +1648,9 @@ def main() -> None:
     render_conversation_header()
     render_messages()
 
+    mode_label = "Agentic RAG" if is_agent_mode() else "Classic RAG"
     submitted_query = st.chat_input(
-        "Ask a policy question about leave, payroll, compliance, onboarding, insurance, or exits"
+        f"[{mode_label}] Ask a policy question about leave, payroll, compliance, onboarding, insurance, or exits"
     )
     if submitted_query:
         process_query(submitted_query)

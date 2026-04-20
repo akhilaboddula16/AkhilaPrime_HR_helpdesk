@@ -7,7 +7,10 @@ This project packages a small RAG-based HR helpdesk for the markdown policy file
 - Markdown-aware section chunking for HR policy documents
 - PostgreSQL plus PGVector for vector storage
 - Google Gemini embeddings and chat generation
-- Streamlit chat UI with grounded answers and evidence
+- Streamlit chat UI with two modes:
+  - **Classic RAG**: Fast, single-shot retrieval for direct answers.
+  - **Agentic RAG**: Multi-step reasoning agent (ReAct) that uses tools to explore policies and self-correct.
+- Full source transparency with evidence packs and reasoning traces.
 
 ## Project structure
 
@@ -15,7 +18,9 @@ This project packages a small RAG-based HR helpdesk for the markdown policy file
 - `hr_helpdesk/step1_chunking.py`: splits markdown files into section chunks
 - `hr_helpdesk/step2_indexing.py`: embeds chunks and stores them in PGVector
 - `hr_helpdesk/step3_retriever.py`: retrieves relevant chunks for a user query
-- `hr_helpdesk/step4_app.py`: Streamlit application
+- `hr_helpdesk/step4_app.py`: Streamlit application (Main UI)
+- `hr_helpdesk/step5_tools.py`: LangChain tool definitions for the agent
+- `hr_helpdesk/step6_agent.py`: LangGraph ReAct agent for Agentic RAG
 - `compose.yaml`: local PostgreSQL plus PGVector setup
 
 ## Quick start
@@ -24,7 +29,9 @@ This project packages a small RAG-based HR helpdesk for the markdown policy file
 2. Install dependencies with `pip install -r requirements.txt`.
 3. Copy the sample environment file with `Copy-Item .env.example .env`.
 4. Set `GOOGLE_API_KEY` in `.env`.
-5. Start PGVector with `docker compose up -d`.
+5. Configure your database:
+   - **Neon (Recommended)**: Set `PGVECTOR_CONNECTION` in `.env`.
+   - **Local Docker (Optional)**: Run `docker compose up -d`.
 6. Build the index with `python -m hr_helpdesk.step2_indexing`.
 7. Run the app with `streamlit run hr_helpdesk/step4_app.py`.
 
@@ -41,27 +48,9 @@ This project packages a small RAG-based HR helpdesk for the markdown policy file
 
 ## Database Options
 
-### Local PGVector (Docker)
+### Neon PostgreSQL (Cloud - Recommended)
 
-This repo includes [compose.yaml](compose.yaml) and [01-enable-vector.sql](postgres/init/01-enable-vector.sql) for local development.
-
-The included Docker setup exposes PostgreSQL on host port `5433`, so the default connection string is:
-
-```text
-postgresql+psycopg://postgres:postgres@localhost:5433/akhilaprime_hr
-```
-
-Useful commands:
-
-```bash
-docker compose up -d
-docker compose ps
-docker compose down
-```
-
-### Neon PostgreSQL (Cloud)
-
-For cloud deployment, use [Neon](https://neon.tech/) as a serverless PostgreSQL provider with built-in pgvector support.
+For cloud deployment and easy setup, use [Neon](https://neon.tech/) as a serverless PostgreSQL provider with built-in pgvector support.
 
 1. Sign up at [neon.tech](https://neon.tech/)
 2. Create a new project and database
@@ -70,6 +59,16 @@ For cloud deployment, use [Neon](https://neon.tech/) as a serverless PostgreSQL 
 
 ```text
 postgresql+psycopg://user:password@ep-xxxxx.us-east-1.neon.tech/akhilaprime_hr?sslmode=require
+```
+
+### Local PGVector (Docker - Optional)
+
+If you prefer local development, use the included [compose.yaml](compose.yaml).
+
+```bash
+docker compose up -d
+docker compose ps
+docker compose down
 ```
 
 Neon automatically enables pgvector, so `PGVECTOR_CREATE_EXTENSION` can remain `true` without issues.

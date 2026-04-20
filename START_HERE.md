@@ -19,9 +19,9 @@ It:
 Install these first on your laptop:
 
 1. Python 3.10 or newer
-2. Docker Desktop
-3. VS Code or any editor
-4. PowerShell terminal
+2. VS Code or any editor
+3. PowerShell terminal
+4. Neon account (recommended for cloud storage) or Docker Desktop (optional for local storage)
 
 ## 3. Open the project folder
 
@@ -89,27 +89,18 @@ GOOGLE_API_KEY=your_google_api_key_here
 
 Keep your real credentials only in `.env`.
 
-## 8. Start Docker Desktop
+## 8. Database Setup (Choose One)
 
-Before running the database, make sure Docker Desktop is open and running.
+### Option A: Neon Cloud (Recommended)
+This project is pre-configured to use **Neon**. Since you are using Neon:
+1. Ensure your `.env` has the `PGVECTOR_CONNECTION` pointing to your Neon database.
+2. Ensure `sslmode=require` is in the connection string.
+3. You can Skip the Docker steps below.
 
-Wait until Docker says it is ready.
-
-## 9. Start the PGVector database
-
-Run:
-
-```powershell
-docker compose up -d
-```
-
-Check if it is healthy:
-
-```powershell
-docker compose ps
-```
-
-You should see the `pgvector` service as healthy.
+### Option B: Local Docker (Optional)
+If you prefer running a database locally:
+1. Start Docker Desktop.
+2. Run `docker compose up -d`.
 
 ## 10. Build the vector index from the HR documents
 
@@ -150,7 +141,7 @@ From the project folder:
 ```powershell
 cd D:\AkhilaPrime_HR
 .\.venv\Scripts\Activate.ps1
-docker compose up -d
+# docker compose up -d  <-- Only if using local Docker
 streamlit run hr_helpdesk/step4_app.py
 ```
 
@@ -246,7 +237,7 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 Copy-Item .env.example .env
-docker compose up -d
+# Set up Neon or run: docker compose up -d
 python -m hr_helpdesk.step2_indexing
 streamlit run hr_helpdesk/step4_app.py
 ```

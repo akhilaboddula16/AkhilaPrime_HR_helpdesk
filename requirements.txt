@@ -1,6 +1,7 @@
 langchain>=0.3.27
 langchain-google-genai>=2.1.12
 langchain-postgres>=0.0.17
+langgraph>=0.2.0
 psycopg[binary]>=3.2.9
 python-dotenv>=1.1.1
 streamlit>=1.55.0
